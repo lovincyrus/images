@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -20,22 +19,23 @@ import (
 )
 
 const (
-	numSeeds = 384
 	// If the number of jobs is < the number of seeds, simulation will crash
+	numSeeds                  = 384
 	numJobs                   = numSeeds
 	instanceShutdownBehaviour = "terminate"
 )
 
 var (
-	channelID   string
-	slackToken  string
-	numBlocks   string
-	simPeriod   string
-	gitRevision string
-	messageTS   string
-	logObjKey   string
-	slackErr    error
-	notifyOnly  bool
+	channelID    string
+	slackToken   string
+	numBlocks    string
+	simPeriod    string
+	gitRevision  string
+	messageTS    string
+	logObjPrefix string
+	err          error
+	notifyOnly   bool
+	genesis      bool
 )
 
 func makeRanges() map[int]string {
@@ -58,6 +58,8 @@ func makeRanges() map[int]string {
 }
 
 func getAmiId(gitRevision string, svc *ec2.EC2) (string, error) {
+	var imageID *ec2.DescribeImagesOutput
+
 	input := &ec2.DescribeImagesInput{
 		Filters: []*ec2.Filter{
 			{
@@ -68,15 +70,18 @@ func getAmiId(gitRevision string, svc *ec2.EC2) (string, error) {
 			},
 		},
 	}
-
-	result, err := svc.DescribeImages(input)
-	if err != nil {
+	if imageID, err = svc.DescribeImages(input); err != nil {
 		return "", err
 	}
-	return *result.Images[0].ImageId, nil
+	return *imageID.Images[0].ImageId, nil
 }
 
-func buildCommand(jobs int, logObjKey, seeds, token, channel, timeStamp, blocks, period string) string {
+func buildCommand(jobs int, logObjKey, seeds, token, channel, timeStamp, blocks, period string, genesis bool) string {
+	if genesis {
+		return fmt.Sprintf("runsim -log \"%s\" -j %d -seeds \"%s\" -g /home/ec2-user/genesis.json "+
+			"-slack \"%s,%s,%s\" github.com/cosmos/cosmos-sdk/simapp %s %s TestFullAppSimulation;",
+			logObjKey, jobs, seeds, token, channel, timeStamp, blocks, period)
+	}
 	return fmt.Sprintf("runsim -log \"%s\" -j %d -seeds \"%s\" -slack \"%s,%s,%s\" github.com/cosmos/cosmos-sdk/simapp %s %s TestFullAppSimulation;",
 		logObjKey, jobs, seeds, token, channel, timeStamp, blocks, period)
 }
@@ -88,9 +93,10 @@ func main() {
 	flag.StringVar(&simPeriod, "p", "", "Simulation invariant check period")
 	flag.StringVar(&gitRevision, "g", "", "The git revision on which the simulation is run")
 	flag.BoolVar(&notifyOnly, "notify", false, "Send notification and exit")
+	flag.BoolVar(&genesis, "gen", false, "Use genesis file in simulation")
 	flag.Usage = func() {
 		_, _ = fmt.Fprintf(flag.CommandLine.Output(),
-			`Usage: %s [-s slacktoken] [-c channelID] [-b numblocks] [-p simperiod] [-g gitrevision]`, filepath.Base(os.Args[0]))
+			`Usage: %s [-notify] [-gen] [-s slacktoken] [-c channelID] [-b numblocks] [-p simperiod] [-g gitrevision]`, filepath.Base(os.Args[0]))
 	}
 	flag.Parse()
 
@@ -105,14 +111,13 @@ func main() {
 
 		// DO NOT REMOVE. This output is used by other tools that run after this one.
 		fmt.Println(msgTS)
-
 		os.Exit(0)
 	}
 
 	messageTS = os.Getenv("MSGTS")
-	_, slackErr = slackMessage(slackToken, channelID, &messageTS, "Spinning up simulation environments!")
-	if slackErr != nil {
-		log.Fatal("Could not report back to slack: " + slackErr.Error())
+	_, err = slackMessage(slackToken, channelID, &messageTS, "Spinning up simulation environments!")
+	if err != nil {
+		log.Fatal("Could not report back to slack: " + err.Error())
 	}
 
 	svc := ec2.New(session.Must(session.NewSession(&aws.Config{
@@ -127,16 +132,14 @@ func main() {
 		log.Fatal(err.Error())
 	}
 
-	logObjKey = fmt.Sprintf("%s/%s", gitRevision, time.Now().Format("01-02-2006_150505"))
+	logObjPrefix = fmt.Sprintf("simID-%s", os.Getenv("CIRCLE_BUILD_NUM"))
 	seeds := makeRanges()
 	for rng := range seeds {
-
 		var userData strings.Builder
 		userData.WriteString("#!/bin/bash \n")
 		userData.WriteString("cd /home/ec2-user/go/src/github.com/cosmos/cosmos-sdk \n")
 		userData.WriteString("source /etc/profile.d/set_env.sh \n")
-		userData.WriteString(buildCommand(numJobs, logObjKey, seeds[rng], slackToken, channelID, messageTS, numBlocks, simPeriod))
-
+		userData.WriteString(buildCommand(numJobs, logObjPrefix, seeds[rng], slackToken, channelID, messageTS, numBlocks, simPeriod, genesis))
 		userData.WriteString("shutdown -h now")
 
 		config := &ec2.RunInstancesInput{
@@ -160,5 +163,7 @@ func main() {
 			log.Println(*result.Instances[i].InstanceId)
 		}
 	}
-	sendSqsMsg(seeds)
+	if len(seeds) > 1 {
+		sendSqsMsg(seeds)
+	}
 }
